@@ -33,8 +33,8 @@ CONFIG = {
     # ── Page range ────────────────────────────────────────────────────────────
     # EVEN stream : MIN_PAGE, MIN_PAGE+2, … MAX_PAGE
     # ODD  stream : MIN_PAGE+1, MIN_PAGE+3, … MAX_PAGE
-    "MIN_PAGE": 0,
-    "MAX_PAGE": 300,
+    "MIN_PAGE": 301,
+    "MAX_PAGE": 1000,
 
     # ── Thread-pool worker count (only used when MODE = "threadpool") ─────────
     "WORKERS": 6,
