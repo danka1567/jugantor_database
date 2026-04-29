@@ -9,7 +9,6 @@ on:
   schedule:
     - cron: "0 21 * * *"      # 21:00 UTC = 03:00 AM BST next day
 
-  # Allow manual trigger from GitHub Actions tab
   workflow_dispatch:
     inputs:
       reset:
@@ -17,7 +16,6 @@ on:
         required: false
         default: "no"
 
-# Only one run at a time — cancel any in-progress run if re-triggered
 concurrency:
   group: jugantor-scraper
   cancel-in-progress: false
@@ -26,10 +24,10 @@ jobs:
   scrape:
     name: Run Jugantor Dual-Stream Scraper
     runs-on: ubuntu-latest
-    timeout-minutes: 300     # 5-hour hard cap (GitHub max is 6h)
+    timeout-minutes: 300
 
     permissions:
-      contents: write        # needed to push jugantor.db back to repo
+      contents: write
 
     steps:
       # ── 1. Checkout repo ───────────────────────────────────────────────────
@@ -52,40 +50,54 @@ jobs:
           pip install --upgrade pip
           pip install requests aiohttp tqdm colorama
 
-      # ── 4. Restore DB from cache (so we keep history across runs) ──────────
+      # ── 4. Restore DB cache (restores jugantor.db and any jugantor1.db etc) ─
       - name: Restore database cache
         uses: actions/cache@v4
         with:
-          path: jugantor.db
+          path: |
+            jugantor.db
+            jugantor*.db
           key: jugantor-db-${{ github.run_number }}
           restore-keys: |
             jugantor-db-
 
-      # ── 5. Show DB status before run ───────────────────────────────────────
+      # ── 5. Pre-run database info ───────────────────────────────────────────
       - name: Pre-run database info
         run: |
           python - << 'EOF'
-          import sqlite3, os
-          db = "jugantor.db"
-          if os.path.exists(db):
-              conn = sqlite3.connect(db)
-              total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-              even  = conn.execute("SELECT value FROM scrape_state WHERE key='cp_even'").fetchone()
-              odd   = conn.execute("SELECT value FROM scrape_state WHERE key='cp_odd'").fetchone()
-              conn.close()
-              print(f"✅ DB found: {total:,} articles stored")
-              print(f"   EVEN checkpoint : {even[0] if even else 'none (fresh)'}")
-              print(f"   ODD  checkpoint : {odd[0]  if odd  else 'none (fresh)'}")
+          import sqlite3, os, glob
+
+          def db_info(path):
+              if not os.path.exists(path):
+                  return
+              size_mb = os.path.getsize(path) / (1024 * 1024)
+              try:
+                  conn = sqlite3.connect(path)
+                  total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+                  even  = conn.execute("SELECT value FROM scrape_state WHERE key='cp_even'").fetchone()
+                  odd   = conn.execute("SELECT value FROM scrape_state WHERE key='cp_odd'").fetchone()
+                  conn.close()
+                  print(f"  📦 {path} — {total:,} articles — {size_mb:.1f} MB")
+                  print(f"     EVEN checkpoint : {even[0] if even else 'none'}")
+                  print(f"     ODD  checkpoint : {odd[0]  if odd  else 'none'}")
+              except Exception as e:
+                  print(f"  ⚠️  {path} — could not read: {e}")
+
+          dbs = sorted(glob.glob("jugantor*.db"))
+          if dbs:
+              print("✅ Existing database files:")
+              for db in dbs:
+                  db_info(db)
           else:
               print("ℹ️  No existing DB — fresh start")
           EOF
 
-      # ── 6. Handle optional reset (manual trigger only) ────────────────────
+      # ── 6. Handle optional reset ──────────────────────────────────────────
       - name: Apply reset if requested
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.reset == 'yes'
         run: |
-          echo "⚠️  RESET requested — removing existing DB"
-          rm -f jugantor.db
+          echo "⚠️  RESET requested — removing all DB files"
+          rm -f jugantor*.db
           echo "RESET=true" >> $GITHUB_ENV
 
       # ── 7. Run the scraper ─────────────────────────────────────────────────
@@ -95,75 +107,230 @@ jobs:
           python scraper.py
           echo "✅ Scraper finished at $(TZ='Asia/Dhaka' date '+%Y-%m-%d %H:%M:%S BST')"
 
-      # ── 8. Post-run summary ────────────────────────────────────────────────
+      # ── 8. DB size check & split if > 50 MB ───────────────────────────────
+      - name: Check and split oversized databases
+        if: always()
+        run: |
+          python - << 'EOF'
+          import sqlite3, os, glob, shutil
+
+          MAX_MB    = 50
+          MAX_BYTES = MAX_MB * 1024 * 1024
+
+          def get_all_dbs():
+              """Return sorted list: jugantor.db first, then jugantor1.db, jugantor2.db ..."""
+              base = ["jugantor.db"] if os.path.exists("jugantor.db") else []
+              numbered = sorted(
+                  [f for f in glob.glob("jugantor[0-9]*.db")],
+                  key=lambda f: int(''.join(filter(str.isdigit, f)) or 0)
+              )
+              return base + numbered
+
+          def next_db_name(existing_names):
+              """Return the next available jugantor<N>.db filename."""
+              nums = []
+              for n in existing_names:
+                  digits = ''.join(filter(str.isdigit, n))
+                  if digits:
+                      nums.append(int(digits))
+              next_num = max(nums) + 1 if nums else 1
+              return f"jugantor{next_num}.db"
+
+          def split_db(source_path):
+              """
+              Split source_path into two halves by row count.
+              Keeps the first half in source_path, moves second half to a new numbered DB.
+              Preserves scrape_state and scrape_runs tables in both halves.
+              """
+              print(f"  ✂️  Splitting {source_path} ...")
+              conn_src = sqlite3.connect(source_path)
+
+              # Read all article row IDs ordered by rowid (insertion order)
+              rowids = [r[0] for r in conn_src.execute(
+                  "SELECT rowid FROM articles ORDER BY rowid"
+              ).fetchall()]
+
+              if not rowids:
+                  print("  ⚠️  No articles found — skipping split")
+                  conn_src.close()
+                  return
+
+              mid     = len(rowids) // 2
+              keep    = set(rowids[:mid])
+              move    = set(rowids[mid:])
+
+              all_dbs  = get_all_dbs()
+              new_name = next_db_name(all_dbs)
+              print(f"  📂 New file: {new_name}")
+
+              # ── Build new DB with the second half ─────────────────────────
+              conn_new = sqlite3.connect(new_name)
+
+              # Replicate schema
+              for row in conn_src.execute(
+                  "SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"
+              ).fetchall():
+                  conn_new.execute(row[0])
+              conn_new.commit()
+
+              # Copy second-half articles
+              cols = [c[1] for c in conn_src.execute("PRAGMA table_info(articles)").fetchall()]
+              col_str = ", ".join(cols)
+              place   = ", ".join(["?"] * len(cols))
+              for rid in sorted(move):
+                  row = conn_src.execute(
+                      f"SELECT {col_str} FROM articles WHERE rowid=?", (rid,)
+                  ).fetchone()
+                  if row:
+                      conn_new.execute(f"INSERT INTO articles ({col_str}) VALUES ({place})", row)
+
+              # Copy scrape_state and scrape_runs into new DB (shared context)
+              for tbl in ("scrape_state", "scrape_runs"):
+                  try:
+                      rows = conn_src.execute(f"SELECT * FROM {tbl}").fetchall()
+                      if rows:
+                          tcols = [c[1] for c in conn_src.execute(f"PRAGMA table_info({tbl})").fetchall()]
+                          tc_str = ", ".join(tcols)
+                          tp_str = ", ".join(["?"] * len(tcols))
+                          conn_new.executemany(
+                              f"INSERT OR REPLACE INTO {tbl} ({tc_str}) VALUES ({tp_str})", rows
+                          )
+                  except Exception:
+                      pass  # table may not exist
+
+              conn_new.commit()
+              conn_new.execute("VACUUM")
+              conn_new.close()
+
+              # ── Delete second half from source DB ─────────────────────────
+              placeholders = ",".join(["?"] * len(move))
+              conn_src.execute(f"DELETE FROM articles WHERE rowid IN ({placeholders})", list(move))
+              conn_src.commit()
+              conn_src.execute("VACUUM")
+              conn_src.close()
+
+              src_mb = os.path.getsize(source_path) / (1024 * 1024)
+              new_mb = os.path.getsize(new_name)     / (1024 * 1024)
+              print(f"  ✅ {source_path}: {len(keep):,} articles → {src_mb:.1f} MB")
+              print(f"  ✅ {new_name}:    {len(move):,} articles → {new_mb:.1f} MB")
+
+          # ── Main loop: check every DB, split if needed ────────────────────
+          changed = True
+          while changed:
+              changed = False
+              for db_path in get_all_dbs():
+                  if not os.path.exists(db_path):
+                      continue
+                  size = os.path.getsize(db_path)
+                  mb   = size / (1024 * 1024)
+                  if size > MAX_BYTES:
+                      print(f"⚠️  {db_path} is {mb:.1f} MB — exceeds {MAX_MB} MB limit")
+                      split_db(db_path)
+                      changed = True   # re-scan after every split
+                      break
+                  else:
+                      print(f"✅ {db_path} — {mb:.1f} MB — OK")
+
+          print("\n📋 Final DB inventory:")
+          for db_path in get_all_dbs():
+              mb = os.path.getsize(db_path) / (1024 * 1024) if os.path.exists(db_path) else 0
+              print(f"   {db_path}: {mb:.1f} MB")
+          EOF
+
+      # ── 9. Post-run summary ────────────────────────────────────────────────
       - name: Post-run database summary
         if: always()
         run: |
           python - << 'EOF'
-          import sqlite3, os
-          db = "jugantor.db"
-          if not os.path.exists(db):
-              print("❌ Database file not found"); exit(0)
-          conn = sqlite3.connect(db)
+          import sqlite3, os, glob
 
-          total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-          even  = conn.execute("SELECT value FROM scrape_state WHERE key='cp_even'").fetchone()
-          odd   = conn.execute("SELECT value FROM scrape_state WHERE key='cp_odd'").fetchone()
+          def db_summary(path):
+              if not os.path.exists(path):
+                  return 0
+              size_mb = os.path.getsize(path) / (1024 * 1024)
+              try:
+                  conn  = sqlite3.connect(path)
+                  total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
+                  conn.close()
+                  print(f"   {path}: {total:,} articles — {size_mb:.1f} MB")
+                  return total
+              except:
+                  print(f"   {path}: unreadable — {size_mb:.1f} MB")
+                  return 0
 
-          # Last run stats
-          run = conn.execute(
-              "SELECT * FROM scrape_runs ORDER BY run_id DESC LIMIT 1"
-          ).fetchone()
-
-          conn.close()
+          dbs = sorted(
+              (["jugantor.db"] if os.path.exists("jugantor.db") else []) +
+              [f for f in glob.glob("jugantor[0-9]*.db")],
+              key=lambda f: int(''.join(filter(str.isdigit, f)) or 0)
+          )
 
           print("=" * 52)
           print("  📊  SCRAPE SUMMARY")
           print("=" * 52)
-          print(f"  Total articles in DB  : {total:,}")
-          if run:
-              cols = ["run_id","started_at","ended_at","mode",
-                      "min_page","max_page","workers","new_saved","duplicates","errors"]
-              r = dict(zip(cols, run))
-              print(f"  This run — new saved  : {r.get('new_saved',0):,}")
-              print(f"  This run — duplicates : {r.get('duplicates',0):,}")
-              print(f"  This run — errors     : {r.get('errors',0)}")
-              print(f"  Mode                  : {r.get('mode','?')}")
-              print(f"  Started               : {r.get('started_at','?')}")
-              print(f"  Ended                 : {r.get('ended_at','?')}")
-          print(f"  EVEN checkpoint       : {even[0] if even else '?'}")
-          print(f"  ODD  checkpoint       : {odd[0]  if odd  else '?'}")
+          grand_total = sum(db_summary(p) for p in dbs)
+          print(f"\n  Grand total articles  : {grand_total:,}")
+          print(f"  Database file count   : {len(dbs)}")
+
+          # Last run stats from primary DB
+          primary = "jugantor.db"
+          if os.path.exists(primary):
+              try:
+                  conn = sqlite3.connect(primary)
+                  run  = conn.execute(
+                      "SELECT * FROM scrape_runs ORDER BY run_id DESC LIMIT 1"
+                  ).fetchone()
+                  conn.close()
+                  if run:
+                      cols = ["run_id","started_at","ended_at","mode",
+                              "min_page","max_page","workers","new_saved","duplicates","errors"]
+                      r = dict(zip(cols, run))
+                      print(f"  This run — new saved  : {r.get('new_saved',0):,}")
+                      print(f"  This run — duplicates : {r.get('duplicates',0):,}")
+                      print(f"  This run — errors     : {r.get('errors',0)}")
+                      print(f"  Mode                  : {r.get('mode','?')}")
+                      print(f"  Started               : {r.get('started_at','?')}")
+                      print(f"  Ended                 : {r.get('ended_at','?')}")
+              except:
+                  pass
           print("=" * 52)
           EOF
 
-      # ── 9. Commit DB back to repo ─────────────────────────────────────────
-      - name: Commit updated database
+      # ── 10. Commit all DB files back to repo ──────────────────────────────
+      - name: Commit updated databases
         if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Only commit if DB actually changed
-          if git diff --quiet jugantor.db 2>/dev/null || \
-             ! git ls-files --error-unmatch jugantor.db 2>/dev/null; then
-            git add jugantor.db scraper.log 2>/dev/null || true
-            TIMESTAMP=$(TZ='Asia/Dhaka' date '+%Y-%m-%d %H:%M BST')
-            git commit -m "🤖 scraper run — ${TIMESTAMP}" \
-              --allow-empty \
-              -m "Automated daily scrape (3 AM BST)" || echo "Nothing new to commit"
-            git push
-          else
+          # Stage jugantor.db and all numbered shards
+          git add jugantor.db jugantor*.db scraper.log 2>/dev/null || true
+
+          # Check if anything actually changed
+          if git diff --cached --quiet; then
             echo "ℹ️  No changes to commit"
+          else
+            git pull --rebase origin main 2>/dev/null || true
+            TIMESTAMP=$(TZ='Asia/Dhaka' date '+%Y-%m-%d %H:%M BST')
+
+            # Build a summary line: list which DB files changed
+            CHANGED_DBS=$(git diff --cached --name-only | grep '\.db$' | tr '\n' ' ')
+
+            git commit \
+              -m "🤖 scraper run — ${TIMESTAMP}" \
+              -m "Updated: ${CHANGED_DBS}" \
+              -m "Automated daily scrape (3 AM BST)"
+            git push
           fi
 
-      # ── 10. Upload DB as artifact (30-day retention) ───────────────────────
-      - name: Upload database artifact
+      # ── 11. Upload all DB shards as artifacts ─────────────────────────────
+      - name: Upload database artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jugantor-db-${{ github.run_number }}
           path: |
             jugantor.db
-            jugantor_scraper.log
+            jugantor*.db
+            scraper.log
           retention-days: 30
           if-no-files-found: ignore
