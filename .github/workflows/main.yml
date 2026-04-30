@@ -1,85 +1,112 @@
-- name: Split oversized databases
-        run: |
-          python - << 'PYEOF'
-          import sqlite3, os, glob
+name: Jugantor Scraper — Daily 3 AM BST
 
-          # 48MB limit to stay safe
-          MAX_BYTES = 48 * 1024 * 1024 
+on:
+  schedule:
+    - cron: "0 21 * * *"
 
-          def get_all_dbs():
-              # Explicitly look in the current working directory
-              return sorted(glob.glob(os.path.join(os.getcwd(), "jugantor*.db")))
+  workflow_dispatch:
+    inputs:
+      reset:
+        description: "Reset DB and start from page 0? (yes/no)"
+        required: false
+        default: "no"
 
-          def get_next_name():
-              dbs = get_all_dbs()
-              # Extract numbers from filenames like jugantor1.db, jugantor2.db
-              nums = []
-              for f in dbs:
-                  name = os.path.basename(f)
-                  num_part = "".join(filter(str.isdigit, name))
-                  nums.append(int(num_part) if num_part else 0)
-              return f"jugantor{max(nums)+1 if nums else 1}.db"
+concurrency:
+  group: jugantor-scraper
+  cancel-in-progress: false
 
-          def split_logic(db_path):
-              if not os.path.exists(db_path) or os.path.getsize(db_path) <= MAX_BYTES:
-                  return
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
 
-              print(f"--- Processing {os.path.basename(db_path)} ({os.path.getsize(db_path)//1024//1024}MB) ---")
-              
-              # Use a context manager for the primary connection
-              with sqlite3.connect(db_path) as conn:
-                  cursor = conn.cursor()
-                  
-                  # Check if the 'articles' table exists before proceeding
-                  table_check = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'").fetchone()
-                  if not table_check:
-                      print(f"Table 'articles' not found in {db_path}, skipping.")
-                      return
+    permissions:
+      contents: write
 
-                  total = cursor.execute("SELECT count(*) FROM articles").fetchone()[0]
-                  if total < 2:
-                      return
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-                  new_db_name = get_next_name()
-                  new_db_path = os.path.join(os.getcwd(), new_db_name)
-                  print(f"Creating {new_db_name} and moving half the data...")
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-                  # 1. Attach new database
-                  cursor.execute(f"ATTACH DATABASE '{new_db_path}' AS second_db")
-                  
-                  # 2. Get exact schema and create table in new DB
-                  schema = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='articles'").fetchone()[0]
-                  cursor.execute(f"CREATE TABLE second_db.articles {schema[schema.find('('):]}")
-                  
-                  # 3. Move exactly half the rows (using LIMIT)
-                  limit = total // 2
-                  cursor.execute("INSERT INTO second_db.articles SELECT * FROM articles LIMIT ?", (limit,))
-                  
-                  # 4. Delete those moved rows from source
-                  # Using a subquery for deletion is safer for rowid-based tables
-                  cursor.execute(f"DELETE FROM articles WHERE rowid IN (SELECT rowid FROM articles LIMIT {limit})")
-                  
-                  conn.commit()
-                  # Detach so we can VACUUM safely
-                  cursor.execute("DETACH DATABASE second_db")
+      - name: Install dependencies
+        run: |
+          pip install requests aiohttp tqdm colorama
 
-              # 5. VACUUM must be done outside the 'with' block (connection must be closed or separate)
-              print(f"Vacuuming {os.path.basename(db_path)} to reduce file size...")
-              v_conn = sqlite3.connect(db_path)
-              try:
-                  v_conn.execute("VACUUM")
-              except sqlite3.OperationalError as e:
-                  print(f"Vacuum failed: {e}")
-              finally:
-                  v_conn.close()
+      - name: Run scraper
+        run: python scraper.py
 
-              # Recursive check: if files are still too big, repeat
-              split_logic(db_path)
-              split_logic(new_db_path)
+      # ✅ FIXED SPLITTING STEP
+      - name: Split oversized databases
+        run: |
+          python - << 'PYEOF'
+          import sqlite3, os, glob
 
-          # Start the process
-          for db in get_all_dbs():
-              split_logic(db)
-          
-          print("All database checks complete.")
-          PYEOF
+          MAX_BYTES = 50 * 1024 * 1024
+          ws = os.getcwd()
+
+          def get_all_dbs():
+              return sorted(glob.glob("jugantor*.db"))
+
+          def next_name():
+              nums = [int("".join(filter(str.isdigit, f)) or "0") for f in get_all_dbs()]
+              return f"jugantor{max(nums)+1 if nums else 1}.db"
+
+          # ✅ FIXED HERE
+          def clone_schema(src_conn, dst_conn):
+              for (sql,) in src_conn.execute("""
+                  SELECT sql FROM sqlite_master
+                  WHERE type='table'
+                  AND sql IS NOT NULL
+                  AND name NOT LIKE 'sqlite_%'
+              """):
+                  dst_conn.execute(sql)
+              dst_conn.commit()
+
+          def split_db(path):
+              print(f"Splitting {path}")
+              src = sqlite3.connect(path)
+
+              rows = [r[0] for r in src.execute("SELECT rowid FROM articles")]
+              if not rows:
+                  return
+
+              mid = len(rows)//2
+              move = rows[mid:]
+
+              new_db = next_name()
+              dst = sqlite3.connect(new_db)
+
+              clone_schema(src, dst)
+
+              cols = [c[1] for c in src.execute("PRAGMA table_info(articles)")]
+              cs = ",".join(cols)
+              ph = ",".join(["?"]*len(cols))
+
+              for rid in move:
+                  row = src.execute(f"SELECT {cs} FROM articles WHERE rowid=?", (rid,)).fetchone()
+                  if row:
+                      dst.execute(f"INSERT INTO articles ({cs}) VALUES ({ph})", row)
+
+              dst.commit()
+              dst.close()
+
+              src.execute(f"DELETE FROM articles WHERE rowid >= ?", (move[0],))
+              src.commit()
+              src.close()
+
+          for db in get_all_dbs():
+              if os.path.getsize(db) > MAX_BYTES:
+                  split_db(db)
+          PYEOF
+
+      - name: Commit DB
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@example.com"
+          git add *.db || true
+          git commit -m "Update DB" || true
+          git push || true
