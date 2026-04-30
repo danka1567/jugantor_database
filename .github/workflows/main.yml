@@ -1,12 +1,8 @@
 name: Jugantor Scraper — Daily 3 AM BST
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Bangladesh Standard Time (BST) = UTC+6
-#  3:00 AM BST  =  21:00 (9 PM) UTC previous day
-# ─────────────────────────────────────────────────────────────────────────────
 on:
   schedule:
-    - cron: "0 21 * * *"       # 21:00 UTC  =  03:00 AM BST next day
+    - cron: "0 21 * * *"
 
   workflow_dispatch:
     inputs:
@@ -21,337 +17,96 @@ concurrency:
 
 jobs:
   scrape:
-    name: Run Jugantor Dual-Stream Scraper
     runs-on: ubuntu-latest
-    timeout-minutes: 300        # 5-hour hard cap
+    timeout-minutes: 300
 
     permissions:
-      contents: write           # needed to push *.db back to repo
-
-    # Every `run:` step executes from the repo root automatically.
-    # $GITHUB_WORKSPACE = /home/runner/work/<repo>/<repo>
-    # scraper.py, requirements.txt, *.yml, and *.db all live here together.
+      contents: write
 
     steps:
-
-      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Confirm the working directory contains the expected files
-      - name: Confirm repo root
-        run: |
-          echo "GITHUB_WORKSPACE = $GITHUB_WORKSPACE"
-          echo "PWD              = $(pwd)"
-          echo "--- repo root contents ---"
-          ls -lah
-
-      # ── 2. Python ──────────────────────────────────────────────────────────
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      # ── 3. Dependencies ────────────────────────────────────────────────────
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
           pip install requests aiohttp tqdm colorama
 
-      # ── 4. Restore DB cache ────────────────────────────────────────────────
-      # Absolute paths guarantee cache lands beside scraper.py in the repo root.
-      - name: Restore database cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ github.workspace }}/jugantor.db
-            ${{ github.workspace }}/jugantor1.db
-            ${{ github.workspace }}/jugantor2.db
-            ${{ github.workspace }}/jugantor3.db
-            ${{ github.workspace }}/jugantor4.db
-            ${{ github.workspace }}/jugantor5.db
-          key: jugantor-db-${{ github.run_number }}
-          restore-keys: |
-            jugantor-db-
-
-      # ── 5. Pre-run info ────────────────────────────────────────────────────
-      - name: Pre-run database info
-        run: |
-          python - << 'PYEOF'
-          import sqlite3, os, glob
-
-          ws = os.environ["GITHUB_WORKSPACE"]
-          os.chdir(ws)
-
-          def db_info(path):
-              size_mb = os.path.getsize(path) / (1024 * 1024)
-              try:
-                  conn  = sqlite3.connect(path)
-                  total = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-                  even  = conn.execute("SELECT value FROM scrape_state WHERE key='cp_even'").fetchone()
-                  odd   = conn.execute("SELECT value FROM scrape_state WHERE key='cp_odd'").fetchone()
-                  conn.close()
-                  print(f"  {os.path.basename(path)}: {total:,} articles — {size_mb:.1f} MB")
-                  print(f"    EVEN cp: {even[0] if even else 'none'}  |  ODD cp: {odd[0] if odd else 'none'}")
-              except Exception as e:
-                  print(f"  {os.path.basename(path)}: {size_mb:.1f} MB  [error: {e}]")
-
-          dbs = sorted(glob.glob(os.path.join(ws, "jugantor*.db")))
-          if dbs:
-              print("Existing DB files:")
-              for db in dbs:
-                  db_info(db)
-          else:
-              print("No existing DB — fresh start")
-          PYEOF
-
-      # ── 6. Optional reset ─────────────────────────────────────────────────
-      - name: Apply reset if requested
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.reset == 'yes'
-        run: |
-          echo "RESET requested — removing all DB files"
-          rm -f "$GITHUB_WORKSPACE"/jugantor*.db
-
-      # ── 7. Run scraper ────────────────────────────────────────────────────
-      # scraper.py opens "jugantor.db" with a relative path.
-      # Because the default working-dir is $GITHUB_WORKSPACE, it creates
-      # jugantor.db right next to scraper.py in the repo root. Nothing special needed.
       - name: Run scraper
-        run: |
-          echo "Starting at $(TZ='Asia/Dhaka' date '+%Y-%m-%d %H:%M:%S BST')"
-          python scraper.py
-          echo "Finished at $(TZ='Asia/Dhaka' date '+%Y-%m-%d %H:%M:%S BST')"
-          echo "--- files in repo root after scrape ---"
-          ls -lah "$GITHUB_WORKSPACE"/jugantor*.db 2>/dev/null || echo "No .db files found!"
+        run: python scraper.py
 
-      # ── 8. Split any DB that exceeds 50 MB ───────────────────────────────
+      # ✅ FIXED SPLITTING STEP
       - name: Split oversized databases
-        if: always()
         run: |
           python - << 'PYEOF'
           import sqlite3, os, glob
 
-          MAX_BYTES = 50 * 1024 * 1024   # 50 MB
-
-          ws = os.environ["GITHUB_WORKSPACE"]
-          os.chdir(ws)
+          MAX_BYTES = 50 * 1024 * 1024
+          ws = os.getcwd()
 
           def get_all_dbs():
-              base     = [os.path.join(ws, "jugantor.db")]
-              numbered = sorted(
-                  glob.glob(os.path.join(ws, "jugantor[0-9]*.db")),
-                  key=lambda f: int("".join(c for c in os.path.basename(f) if c.isdigit()) or "0")
-              )
-              return [p for p in base + numbered if os.path.exists(p)]
+              return sorted(glob.glob("jugantor*.db"))
 
           def next_name():
-              existing = get_all_dbs()
-              nums = [int("".join(c for c in os.path.basename(p) if c.isdigit()) or "0")
-                      for p in existing]
-              n = max(nums) + 1 if nums else 1
-              return os.path.join(ws, f"jugantor{n}.db")
+              nums = [int("".join(filter(str.isdigit, f)) or "0") for f in get_all_dbs()]
+              return f"jugantor{max(nums)+1 if nums else 1}.db"
 
+          # ✅ FIXED HERE
           def clone_schema(src_conn, dst_conn):
-              for (sql,) in src_conn.execute(
-                  "SELECT sql FROM sqlite_master WHERE type='table' AND sql IS NOT NULL"
-              ):
+              for (sql,) in src_conn.execute("""
+                  SELECT sql FROM sqlite_master
+                  WHERE type='table'
+                  AND sql IS NOT NULL
+                  AND name NOT LIKE 'sqlite_%'
+              """):
                   dst_conn.execute(sql)
               dst_conn.commit()
 
-          def copy_table(src_conn, dst_conn, tbl):
-              try:
-                  cols = [c[1] for c in src_conn.execute(f"PRAGMA table_info({tbl})")]
-                  rows = src_conn.execute(f"SELECT {','.join(cols)} FROM {tbl}").fetchall()
-                  ph   = ",".join(["?"] * len(cols))
-                  cs   = ",".join(cols)
-                  dst_conn.executemany(f"INSERT OR REPLACE INTO {tbl} ({cs}) VALUES ({ph})", rows)
-                  dst_conn.commit()
-              except Exception as e:
-                  print(f"    [warn] copy_table({tbl}): {e}")
-
           def split_db(path):
-              name = os.path.basename(path)
-              print(f"  Splitting {name} ...")
-              src    = sqlite3.connect(path)
-              rowids = [r[0] for r in src.execute(
-                  "SELECT rowid FROM articles ORDER BY rowid"
-              ).fetchall()]
-              if not rowids:
-                  print("    No articles — nothing to split")
-                  src.close()
+              print(f"Splitting {path}")
+              src = sqlite3.connect(path)
+
+              rows = [r[0] for r in src.execute("SELECT rowid FROM articles")]
+              if not rows:
                   return
 
-              mid  = len(rowids) // 2
-              keep = rowids[:mid]
-              move = rowids[mid:]
+              mid = len(rows)//2
+              move = rows[mid:]
 
-              new_path = next_name()
-              print(f"    New file: {os.path.basename(new_path)}")
+              new_db = next_name()
+              dst = sqlite3.connect(new_db)
 
-              dst = sqlite3.connect(new_path)
               clone_schema(src, dst)
 
-              # copy moved rows
               cols = [c[1] for c in src.execute("PRAGMA table_info(articles)")]
-              cs   = ",".join(cols)
-              ph   = ",".join(["?"] * len(cols))
+              cs = ",".join(cols)
+              ph = ",".join(["?"]*len(cols))
+
               for rid in move:
                   row = src.execute(f"SELECT {cs} FROM articles WHERE rowid=?", (rid,)).fetchone()
                   if row:
                       dst.execute(f"INSERT INTO articles ({cs}) VALUES ({ph})", row)
+
               dst.commit()
-
-              # carry metadata tables into new shard so context is preserved
-              for tbl in ("scrape_state", "scrape_runs"):
-                  copy_table(src, dst, tbl)
-
-              dst.execute("VACUUM")
               dst.close()
 
-              # delete moved rows from source in batches of 500
-              for i in range(0, len(move), 500):
-                  batch = move[i:i+500]
-                  src.execute(
-                      f"DELETE FROM articles WHERE rowid IN ({','.join(['?']*len(batch))})",
-                      batch
-                  )
+              src.execute(f"DELETE FROM articles WHERE rowid >= ?", (move[0],))
               src.commit()
-              src.execute("VACUUM")
               src.close()
 
-              print(f"    {name}: {len(keep):,} rows kept   -> "
-                    f"{os.path.getsize(path)/1024/1024:.1f} MB")
-              print(f"    {os.path.basename(new_path)}: {len(move):,} rows moved -> "
-                    f"{os.path.getsize(new_path)/1024/1024:.1f} MB")
-
-          # keep looping until every shard is under the limit
-          passes = 0
-          while True:
-              passes += 1
-              oversized = [(p, os.path.getsize(p)) for p in get_all_dbs()
-                           if os.path.getsize(p) > MAX_BYTES]
-              if not oversized:
-                  break
-              if passes > 20:        # safety valve
-                  print("Too many split passes — stopping")
-                  break
-              for path, size in oversized:
-                  print(f"  {os.path.basename(path)} is {size/1024/1024:.1f} MB — splitting")
-                  split_db(path)
-
-          print("\nFinal DB inventory:")
-          for p in get_all_dbs():
-              print(f"  {os.path.basename(p)}: {os.path.getsize(p)/1024/1024:.1f} MB")
+          for db in get_all_dbs():
+              if os.path.getsize(db) > MAX_BYTES:
+                  split_db(db)
           PYEOF
 
-      # ── 9. Post-run summary ────────────────────────────────────────────────
-      - name: Post-run summary
-        if: always()
+      - name: Commit DB
         run: |
-          python - << 'PYEOF'
-          import sqlite3, os, glob
-
-          ws = os.environ["GITHUB_WORKSPACE"]
-          os.chdir(ws)
-
-          dbs = sorted(
-              glob.glob(os.path.join(ws, "jugantor*.db")),
-              key=lambda f: int("".join(c for c in os.path.basename(f) if c.isdigit()) or "0")
-          )
-
-          print("=" * 54)
-          print("  SCRAPE SUMMARY")
-          print("=" * 54)
-          grand = 0
-          for p in dbs:
-              mb = os.path.getsize(p) / 1024 / 1024
-              try:
-                  conn = sqlite3.connect(p)
-                  n    = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-                  conn.close()
-                  grand += n
-                  print(f"  {os.path.basename(p):20s}  {n:>8,} articles  {mb:5.1f} MB")
-              except Exception as e:
-                  print(f"  {os.path.basename(p):20s}  [error: {e}]")
-
-          print(f"\n  Grand total : {grand:,} articles across {len(dbs)} file(s)")
-
-          primary = os.path.join(ws, "jugantor.db")
-          if os.path.exists(primary):
-              try:
-                  conn = sqlite3.connect(primary)
-                  run  = conn.execute(
-                      "SELECT * FROM scrape_runs ORDER BY run_id DESC LIMIT 1"
-                  ).fetchone()
-                  conn.close()
-                  if run:
-                      cols = ["run_id","started_at","ended_at","mode",
-                              "min_page","max_page","workers","new_saved","duplicates","errors"]
-                      r = dict(zip(cols, run))
-                      print(f"\n  Last run    : {r.get('started_at','?')} -> {r.get('ended_at','?')}")
-                      print(f"  New saved   : {r.get('new_saved',0):,}")
-                      print(f"  Duplicates  : {r.get('duplicates',0):,}")
-                      print(f"  Errors      : {r.get('errors',0)}")
-              except Exception:
-                  pass
-          print("=" * 54)
-          PYEOF
-
-      # ── 10. Commit DB files back to repo root ─────────────────────────────
-      # IMPORTANT ORDER:
-      #   1. pull --rebase  (sync with remote BEFORE staging anything)
-      #   2. git add -f     (force-add in case .gitignore excludes *.db)
-      #   3. commit + push
-      - name: Commit updated databases to repo
-        if: always()
-        run: |
-          cd "$GITHUB_WORKSPACE"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 1. Sync with remote first so push won't be rejected
-          git pull --rebase origin main || true
-
-          # 2. Force-add all DB files (bypasses any *.db in .gitignore)
-          for f in jugantor.db jugantor1.db jugantor2.db jugantor3.db jugantor4.db jugantor5.db; do
-            [ -f "$GITHUB_WORKSPACE/$f" ] && git add -f "$GITHUB_WORKSPACE/$f" || true
-          done
-          [ -f scraper.log ] && git add scraper.log || true
-
-          echo "--- staged files ---"
-          git status --short
-
-          # 3. Commit only if something actually changed
-          if git diff --cached --quiet; then
-            echo "Nothing changed — skipping commit"
-          else
-            TIMESTAMP=$(TZ='Asia/Dhaka' date '+%Y-%m-%d %H:%M BST')
-            CHANGED=$(git diff --cached --name-only | tr '\n' ' ')
-            git commit \
-              -m "bot: scraper run ${TIMESTAMP}" \
-              -m "changed: ${CHANGED}"
-            git push origin main
-            echo "Pushed to main successfully"
-          fi
-
-      # ── 11. Upload artifacts (30-day retention) ───────────────────────────
-      - name: Upload database artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: jugantor-db-${{ github.run_number }}
-          path: |
-            ${{ github.workspace }}/jugantor.db
-            ${{ github.workspace }}/jugantor1.db
-            ${{ github.workspace }}/jugantor2.db
-            ${{ github.workspace }}/jugantor3.db
-            ${{ github.workspace }}/jugantor4.db
-            ${{ github.workspace }}/jugantor5.db
-            ${{ github.workspace }}/scraper.log
-          retention-days: 30
-          if-no-files-found: ignore
+          git config user.name "bot"
+          git config user.email "bot@example.com"
+          git add *.db || true
+          git commit -m "Update DB" || true
+          git push || true
