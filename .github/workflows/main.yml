@@ -1,112 +1,125 @@
 name: Jugantor Scraper — Daily 3 AM BST
 
 on:
-  schedule:
-    - cron: "0 21 * * *"
+  schedule:
+    - cron: "0 21 * * *"
 
-  workflow_dispatch:
-    inputs:
-      reset:
-        description: "Reset DB and start from page 0? (yes/no)"
-        required: false
-        default: "no"
+  workflow_dispatch:
+    inputs:
+      reset:
+        description: "Reset DB and start from page 0? (yes/no)"
+        required: false
+        default: "no"
 
 concurrency:
-  group: jugantor-scraper
-  cancel-in-progress: false
+  group: jugantor-scraper
+  cancel-in-progress: false
 
 jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
 
-    permissions:
-      contents: write
+    permissions:
+      contents: write
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install requests aiohttp tqdm colorama
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests aiohttp tqdm colorama
 
-      - name: Run scraper
-        run: python scraper.py
+      # ✅ Create data folder
+      - name: Ensure data folder exists
+        run: mkdir -p data
 
-      # ✅ FIXED SPLITTING STEP
-      - name: Split oversized databases
-        run: |
-          python - << 'PYEOF'
-          import sqlite3, os, glob
+      # ✅ Run scraper (DB must save into data/)
+      - name: Run scraper
+        run: |
+          python scraper.py
 
-          MAX_BYTES = 50 * 1024 * 1024
-          ws = os.getcwd()
+      # ✅ Split DB inside data/
+      - name: Split oversized databases
+        run: |
+          python - << 'PYEOF'
+          import sqlite3, os, glob
 
-          def get_all_dbs():
-              return sorted(glob.glob("jugantor*.db"))
+          MAX_BYTES = 50 * 1024 * 1024
+          BASE_DIR = "data"
 
-          def next_name():
-              nums = [int("".join(filter(str.isdigit, f)) or "0") for f in get_all_dbs()]
-              return f"jugantor{max(nums)+1 if nums else 1}.db"
+          def get_all_dbs():
+              return sorted(glob.glob(os.path.join(BASE_DIR, "jugantor*.db")))
 
-          # ✅ FIXED HERE
-          def clone_schema(src_conn, dst_conn):
-              for (sql,) in src_conn.execute("""
-                  SELECT sql FROM sqlite_master
-                  WHERE type='table'
-                  AND sql IS NOT NULL
-                  AND name NOT LIKE 'sqlite_%'
-              """):
-                  dst_conn.execute(sql)
-              dst_conn.commit()
+          def next_name():
+              nums = []
+              for f in get_all_dbs():
+                  digits = "".join(filter(str.isdigit, os.path.basename(f)))
+                  nums.append(int(digits) if digits else 0)
+              return os.path.join(BASE_DIR, f"jugantor{max(nums)+1 if nums else 1}.db")
 
-          def split_db(path):
-              print(f"Splitting {path}")
-              src = sqlite3.connect(path)
+          def clone_schema(src_conn, dst_conn):
+              for (sql,) in src_conn.execute("""
+                  SELECT sql FROM sqlite_master
+                  WHERE type='table'
+                  AND sql IS NOT NULL
+                  AND name NOT LIKE 'sqlite_%'
+              """):
+                  dst_conn.execute(sql)
+              dst_conn.commit()
 
-              rows = [r[0] for r in src.execute("SELECT rowid FROM articles")]
-              if not rows:
-                  return
+          def split_db(path):
+              print(f"Splitting {path}")
+              src = sqlite3.connect(path)
 
-              mid = len(rows)//2
-              move = rows[mid:]
+              rows = [r[0] for r in src.execute("SELECT rowid FROM articles")]
+              if not rows:
+                  src.close()
+                  return
 
-              new_db = next_name()
-              dst = sqlite3.connect(new_db)
+              mid = len(rows) // 2
+              move = rows[mid:]
 
-              clone_schema(src, dst)
+              new_db = next_name()
+              dst = sqlite3.connect(new_db)
 
-              cols = [c[1] for c in src.execute("PRAGMA table_info(articles)")]
-              cs = ",".join(cols)
-              ph = ",".join(["?"]*len(cols))
+              clone_schema(src, dst)
 
-              for rid in move:
-                  row = src.execute(f"SELECT {cs} FROM articles WHERE rowid=?", (rid,)).fetchone()
-                  if row:
-                      dst.execute(f"INSERT INTO articles ({cs}) VALUES ({ph})", row)
+              cols = [c[1] for c in src.execute("PRAGMA table_info(articles)")]
+              cs = ",".join(cols)
+              ph = ",".join(["?"] * len(cols))
 
-              dst.commit()
-              dst.close()
+              for rid in move:
+                  row = src.execute(f"SELECT {cs} FROM articles WHERE rowid=?", (rid,)).fetchone()
+                  if row:
+                      dst.execute(f"INSERT INTO articles ({cs}) VALUES ({ph})", row)
 
-              src.execute(f"DELETE FROM articles WHERE rowid >= ?", (move[0],))
-              src.commit()
-              src.close()
+              dst.commit()
+              dst.close()
 
-          for db in get_all_dbs():
-              if os.path.getsize(db) > MAX_BYTES:
-                  split_db(db)
-          PYEOF
+              src.execute(f"DELETE FROM articles WHERE rowid IN ({','.join(['?']*len(move))})", move)
+              src.commit()
+              src.close()
 
-      - name: Commit DB
-        run: |
-          git config user.name "bot"
-          git config user.email "bot@example.com"
-          git add *.db || true
-          git commit -m "Update DB" || true
-          git push || true
+          for db in get_all_dbs():
+              if os.path.getsize(db) > MAX_BYTES:
+                  split_db(db)
+          PYEOF
+
+      # ✅ Commit only data folder
+      - name: Commit DB
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          git add data/*.db || true
+
+          git diff --cached --quiet || git commit -m "Update DB"
+          git push
