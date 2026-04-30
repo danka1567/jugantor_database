@@ -73,12 +73,13 @@ CONFIG = {
 #  ▲▲▲  END CONFIG  ▲▲▲
 # ══════════════════════════════════════════════════════════════════════════════
 # ✅ ADD THIS BLOCK HERE
+import os
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
 CONFIG["DB_FILE"] = os.path.join(DATA_DIR, CONFIG["DB_FILE"])
 CONFIG["LOG_FILE"] = os.path.join(DATA_DIR, CONFIG["LOG_FILE"]) if CONFIG["LOG_FILE"] else ""
-import os
+
 import asyncio
 import logging
 import random
