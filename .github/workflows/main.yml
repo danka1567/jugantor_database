@@ -1,112 +1,66 @@
-name: Jugantor Scraper — Daily 3 AM BST
-
-on:
-  schedule:
-    - cron: "0 21 * * *"
-
-  workflow_dispatch:
-    inputs:
-      reset:
-        description: "Reset DB and start from page 0? (yes/no)"
-        required: false
-        default: "no"
-
-concurrency:
-  group: jugantor-scraper
-  cancel-in-progress: false
-
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          pip install requests aiohttp tqdm colorama
-
-      - name: Run scraper
-        run: python scraper.py
-
-      # ✅ FIXED SPLITTING STEP
-      - name: Split oversized databases
+- name: Split oversized databases
         run: |
           python - << 'PYEOF'
           import sqlite3, os, glob
 
-          MAX_BYTES = 50 * 1024 * 1024
-          ws = os.getcwd()
-
+          # Setting limit to 48MB to stay safely under the 50MB GitHub warning threshold
+          MAX_BYTES = 48 * 1024 * 1024 
+          
           def get_all_dbs():
+              # This ensures we are looking in the current working directory (where scraper.py is)
               return sorted(glob.glob("jugantor*.db"))
 
-          def next_name():
-              nums = [int("".join(filter(str.isdigit, f)) or "0") for f in get_all_dbs()]
+          def get_next_name():
+              dbs = get_all_dbs()
+              nums = [int("".join(filter(str.isdigit, f)) or "0") for f in dbs]
               return f"jugantor{max(nums)+1 if nums else 1}.db"
 
-          # ✅ FIXED HERE
-          def clone_schema(src_conn, dst_conn):
-              for (sql,) in src_conn.execute("""
-                  SELECT sql FROM sqlite_master
-                  WHERE type='table'
-                  AND sql IS NOT NULL
-                  AND name NOT LIKE 'sqlite_%'
-              """):
-                  dst_conn.execute(sql)
-              dst_conn.commit()
-
-          def split_db(path):
-              print(f"Splitting {path}")
-              src = sqlite3.connect(path)
-
-              rows = [r[0] for r in src.execute("SELECT rowid FROM articles")]
-              if not rows:
+          def split_logic(db_path):
+              if os.path.getsize(db_path) <= MAX_BYTES:
                   return
 
-              mid = len(rows)//2
-              move = rows[mid:]
+              print(f"Splitting {db_path}...")
+              
+              conn = sqlite3.connect(db_path)
+              cursor = conn.cursor()
+              
+              # Get total row count
+              cursor.execute("SELECT count(*) FROM articles")
+              total = cursor.fetchone()[0]
+              
+              if total < 2:
+                  conn.close()
+                  return
 
-              new_db = next_name()
-              dst = sqlite3.connect(new_db)
+              # Create a new DB file
+              new_db = get_next_name()
+              
+              # Attach the new DB to the current connection to move data efficiently
+              cursor.execute(f"ATTACH DATABASE '{new_db}' AS second_db")
+              
+              # Clone the table structure
+              schema = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='articles'").fetchone()[0]
+              cursor.execute(f"CREATE TABLE second_db.articles {schema[schema.find('('):]}")
+              
+              # Move the older half of the data to the new file
+              # (Assuming you want to keep the newest data in the primary/current file)
+              limit = total // 2
+              cursor.execute(f"INSERT INTO second_db.articles SELECT * FROM articles LIMIT {limit}")
+              cursor.execute(f"DELETE FROM articles WHERE rowid IN (SELECT rowid FROM articles LIMIT {limit})")
+              
+              conn.commit()
+              conn.close()
 
-              clone_schema(src, dst)
+              # IMPORTANT: Vacuum the original DB to actually shrink the file size
+              print(f"Shrinking {db_path}...")
+              v_conn = sqlite3.connect(db_path)
+              v_conn.execute("VACUUM")
+              v_conn.close()
 
-              cols = [c[1] for c in src.execute("PRAGMA table_info(articles)")]
-              cs = ",".join(cols)
-              ph = ",".join(["?"]*len(cols))
-
-              for rid in move:
-                  row = src.execute(f"SELECT {cs} FROM articles WHERE rowid=?", (rid,)).fetchone()
-                  if row:
-                      dst.execute(f"INSERT INTO articles ({cs}) VALUES ({ph})", row)
-
-              dst.commit()
-              dst.close()
-
-              src.execute(f"DELETE FROM articles WHERE rowid >= ?", (move[0],))
-              src.commit()
-              src.close()
+              # Recursively check if the files are still too big (e.g., if it was 150MB)
+              split_logic(db_path)
+              split_logic(new_db)
 
           for db in get_all_dbs():
-              if os.path.getsize(db) > MAX_BYTES:
-                  split_db(db)
+              split_logic(db)
           PYEOF
-
-      - name: Commit DB
-        run: |
-          git config user.name "bot"
-          git config user.email "bot@example.com"
-          git add *.db || true
-          git commit -m "Update DB" || true
-          git push || true
