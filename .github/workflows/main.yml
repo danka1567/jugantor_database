@@ -3,64 +3,83 @@
           python - << 'PYEOF'
           import sqlite3, os, glob
 
-          # Setting limit to 48MB to stay safely under the 50MB GitHub warning threshold
+          # 48MB limit to stay safe
           MAX_BYTES = 48 * 1024 * 1024 
-          
+
           def get_all_dbs():
-              # This ensures we are looking in the current working directory (where scraper.py is)
-              return sorted(glob.glob("jugantor*.db"))
+              # Explicitly look in the current working directory
+              return sorted(glob.glob(os.path.join(os.getcwd(), "jugantor*.db")))
 
           def get_next_name():
               dbs = get_all_dbs()
-              nums = [int("".join(filter(str.isdigit, f)) or "0") for f in dbs]
+              # Extract numbers from filenames like jugantor1.db, jugantor2.db
+              nums = []
+              for f in dbs:
+                  name = os.path.basename(f)
+                  num_part = "".join(filter(str.isdigit, name))
+                  nums.append(int(num_part) if num_part else 0)
               return f"jugantor{max(nums)+1 if nums else 1}.db"
 
           def split_logic(db_path):
-              if os.path.getsize(db_path) <= MAX_BYTES:
+              if not os.path.exists(db_path) or os.path.getsize(db_path) <= MAX_BYTES:
                   return
 
-              print(f"Splitting {db_path}...")
+              print(f"--- Processing {os.path.basename(db_path)} ({os.path.getsize(db_path)//1024//1024}MB) ---")
               
-              conn = sqlite3.connect(db_path)
-              cursor = conn.cursor()
-              
-              # Get total row count
-              cursor.execute("SELECT count(*) FROM articles")
-              total = cursor.fetchone()[0]
-              
-              if total < 2:
-                  conn.close()
-                  return
+              # Use a context manager for the primary connection
+              with sqlite3.connect(db_path) as conn:
+                  cursor = conn.cursor()
+                  
+                  # Check if the 'articles' table exists before proceeding
+                  table_check = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='articles'").fetchone()
+                  if not table_check:
+                      print(f"Table 'articles' not found in {db_path}, skipping.")
+                      return
 
-              # Create a new DB file
-              new_db = get_next_name()
-              
-              # Attach the new DB to the current connection to move data efficiently
-              cursor.execute(f"ATTACH DATABASE '{new_db}' AS second_db")
-              
-              # Clone the table structure
-              schema = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='articles'").fetchone()[0]
-              cursor.execute(f"CREATE TABLE second_db.articles {schema[schema.find('('):]}")
-              
-              # Move the older half of the data to the new file
-              # (Assuming you want to keep the newest data in the primary/current file)
-              limit = total // 2
-              cursor.execute(f"INSERT INTO second_db.articles SELECT * FROM articles LIMIT {limit}")
-              cursor.execute(f"DELETE FROM articles WHERE rowid IN (SELECT rowid FROM articles LIMIT {limit})")
-              
-              conn.commit()
-              conn.close()
+                  total = cursor.execute("SELECT count(*) FROM articles").fetchone()[0]
+                  if total < 2:
+                      return
 
-              # IMPORTANT: Vacuum the original DB to actually shrink the file size
-              print(f"Shrinking {db_path}...")
+                  new_db_name = get_next_name()
+                  new_db_path = os.path.join(os.getcwd(), new_db_name)
+                  print(f"Creating {new_db_name} and moving half the data...")
+
+                  # 1. Attach new database
+                  cursor.execute(f"ATTACH DATABASE '{new_db_path}' AS second_db")
+                  
+                  # 2. Get exact schema and create table in new DB
+                  schema = cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='articles'").fetchone()[0]
+                  cursor.execute(f"CREATE TABLE second_db.articles {schema[schema.find('('):]}")
+                  
+                  # 3. Move exactly half the rows (using LIMIT)
+                  limit = total // 2
+                  cursor.execute("INSERT INTO second_db.articles SELECT * FROM articles LIMIT ?", (limit,))
+                  
+                  # 4. Delete those moved rows from source
+                  # Using a subquery for deletion is safer for rowid-based tables
+                  cursor.execute(f"DELETE FROM articles WHERE rowid IN (SELECT rowid FROM articles LIMIT {limit})")
+                  
+                  conn.commit()
+                  # Detach so we can VACUUM safely
+                  cursor.execute("DETACH DATABASE second_db")
+
+              # 5. VACUUM must be done outside the 'with' block (connection must be closed or separate)
+              print(f"Vacuuming {os.path.basename(db_path)} to reduce file size...")
               v_conn = sqlite3.connect(db_path)
-              v_conn.execute("VACUUM")
-              v_conn.close()
+              try:
+                  v_conn.execute("VACUUM")
+              except sqlite3.OperationalError as e:
+                  print(f"Vacuum failed: {e}")
+              finally:
+                  v_conn.close()
 
-              # Recursively check if the files are still too big (e.g., if it was 150MB)
+              # Recursive check: if files are still too big, repeat
               split_logic(db_path)
-              split_logic(new_db)
+              split_logic(new_db_path)
 
+          # Start the process
           for db in get_all_dbs():
               split_logic(db)
+          
+          print("All database checks complete.")
           PYEOF
